@@ -1,20 +1,12 @@
-# --- Core Frameworks ---
+
 pyrogram
 tgcrypto
 motor
 dnspython
-
-# --- Networking & Web ---
 requests
 aiohttp
 urllib3
-
-# --- YouTube & Downloader ---
-# Direct Master branch se install hoga taaki latest patches milte rahein
 git+https://github.com/yt-dlp/yt-dlp.git@master
-
-# --- Database ---
 pymongo[srv]
-
-# --- Media Processing ---
-# Note: FFmpeg aur Aria2c system-level dependencies hain
+aria2p
+FFmpeg

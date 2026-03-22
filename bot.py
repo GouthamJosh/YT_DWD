@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8265938832:AAFReNH4L0jiNiEVWFDRgslyInhK31AOgn8")
 DOWNLOAD_DIR = "/tmp/ytdl"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 

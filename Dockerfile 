@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+# Install ffmpeg and system deps
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements first (cache layer)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy bot code
+COPY bot.py .
+
+# Create download directory
+RUN mkdir -p /tmp/ytdl
+
+# Non-root user (security)
+RUN useradd -m botuser && chown -R botuser:botuser /app /tmp/ytdl
+USER botuser
+
+CMD ["python", "-u", "bot.py"]

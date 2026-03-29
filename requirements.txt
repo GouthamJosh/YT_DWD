@@ -1,7 +1,3 @@
-python-telegram-bot==21.6
+pyrofork
+TgCrypto
 yt-dlp
-Pillow>=10.0.0
-requests>=2.31.0
-httpx[socks]>=0.27.0
-aiohttp>=3.9.0
-playwright>=1.44.0

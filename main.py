@@ -18,7 +18,7 @@ from aiohttp import web
 # ╚══════════════════════════════════════╝
 API_ID    = 33675350
 API_HASH  = "2f97c845b067a750c9f36fec497acf97"
-BOT_TOKEN = "8489527645:AAGokjooAXkg2L6qXhr0ThG1rPahxjEUQ5Q"
+BOT_TOKEN = "8681815818:AAGbu63vAnVwfQF6gFZAa1_Kh3cPxpzRvLI"
 
 PROXY_URL     = "http://dLAG1sTQ6:qKE6euVsA@138.249.190.195:62694"
 AUTH_USERS    = []    

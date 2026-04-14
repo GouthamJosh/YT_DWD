@@ -16,9 +16,9 @@ from aiohttp import web
 # ╔══════════════════════════════════════╗
 # ║             CONFIG                   ║
 # ╚══════════════════════════════════════╝
-API_ID    = 33675350
-API_HASH  = "2f97c845b067a750c9f36fec497acf97"
-BOT_TOKEN = "8681815818:AAGbu63vAnVwfQF6gFZAa1_Kh3cPxpzRvLI"
+API_ID    = int(os.environ.get("API_ID", 8000))
+API_HASH  = int(os.environ.get("API_HASH", 8000))
+BOT_TOKEN = int(os.environ.get("BOT_TOKEN", 8000))
 
 PROXY_URL     = "http://dLAG1sTQ6:qKE6euVsA@138.249.190.195:62694"
 AUTH_USERS    = []    

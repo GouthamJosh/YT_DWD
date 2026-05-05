@@ -20,11 +20,11 @@ API_ID    = int(os.environ.get("API_ID", ""))
 API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-PROXY_URL     = "http://dLAG1sTQ6:qKE6euVsA@138.249.190.195:62694"
+PROXY_URL     = None  # Render/Koyeb have direct internet access, no proxy needed
 AUTH_USERS    = []    
 MAX_PLAYLIST  = 50
 SESSION_TTL   = 600   
-PORT          = int(os.environ.get("PORT", 8000)) # Koyeb Health Check Port
+PORT          = int(os.environ.get("PORT", 8000))
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
@@ -84,16 +84,8 @@ def pbar(pct, w=10):
 
 def is_auth(uid):    return not AUTH_USERS or uid in AUTH_USERS
 def safe_name(s, n=180):
-    """
-    WZML-X style filename:
-    "Yeh Pyaar Nahi Toh Kya Hai - Ep 03 - Full Episode - 21st March, 2018 1080p25.fps 3033.mp4"
-    Keep: letters, digits, spaces, hyphens, dots, commas, apostrophes, parentheses
-    Remove: only truly unsafe filesystem chars
-    """
     if not s: return "file"
-    # Remove only filesystem-unsafe chars
     s = re.sub(r'[/\\:*?"<>|]', '', s)
-    # Collapse multiple spaces
     s = re.sub(r' +', ' ', s)
     return s[:n].strip() or "file"
 
@@ -108,24 +100,13 @@ def extract_url(text):
     return m.group(0) if m else None
 
 def is_playlist_url(url):
-    # BUG FIX: list= param wali URLs bhi playlist hain
-    # e.g. youtube.com/watch?v=xxx&list=PLyyy — mixed video+playlist URL
-    if re.search(r"[?&]list=PL[a-zA-Z0-9_-]+", url): return True  # YouTube playlist ID
+    if re.search(r"[?&]list=PL[a-zA-Z0-9_-]+", url): return True
     if re.search(r"(playlist\?list=|/playlist/)", url, re.I): return True
     return False
 
 async def _safe_edit(msg, text):
-    from pyrogram.errors import FloodWait
-    try:
+    with suppress(Exception):
         await msg.edit_text(text)
-    except FloodWait as e:
-        await asyncio.sleep(max(e.value, 5))
-        try:
-            await msg.edit_text(text)
-        except Exception:
-            pass
-    except Exception:
-        pass
 
 # ═══════════════════════════════════════════
 #    PROGRESS TRACKER
@@ -212,7 +193,7 @@ def _base_opts():
             "Accept-Language": "en-US,en;q=0.9",
         },
         "extractor_args": {"youtube": {"player_client": ["web","tv"], "skip": ["dash"]}},
-        "remote_components": ["ejs:github"], # Deno magic
+        "remote_components": ["ejs:github"],
     }
     if COOKIES_FILE: o["cookiefile"] = COOKIES_FILE
     if PROXY_URL:    o["proxy"]      = PROXY_URL
@@ -224,7 +205,7 @@ def _info_opts():
         "quiet": True, 
         "no_warnings": True, 
         "playlist_items": "0",
-        "format": "bv*+ba/b"  # 👈 Prevents "Requested format not available" errors
+        "format": "bv*+ba/b"
     })
     return o
 
@@ -307,7 +288,7 @@ def _kb_main(fmts, uid, is_pl, tl):
                 row.append(InlineKeyboardButton(b_name, callback_data=f"q|{uid}|dict|{b_name}"))
             if len(row) == 2: btns.append(row); row = []
         if row: btns.append(row)
-        msg = f"🎬 **Choose Quality:**\n⏳ `{time_fmt(tl)}`"
+        msg = f"🎬 **Select Quality:**\n⏳ `{time_fmt(tl)}`"
     btns.append([
         InlineKeyboardButton("🎵 MP3", callback_data=f"q|{uid}|mp3|"),
         InlineKeyboardButton("🎧 Audio Formats", callback_data=f"q|{uid}|audiofmt|"),
@@ -376,15 +357,13 @@ def _blocking_info(url):
         return None
 
 def _blocking_playlist_info(url):
-    # BUG FIX: Remove playlist_items="0" — it was only for info fetch,
-    # setting "0" in playlist prevents entries from coming!
     opts = _info_opts()
-    opts.pop("playlist_items", None)   # ← CRITICAL FIX
-    opts.pop("format", None)           # no format needed for playlist info
+    opts.pop("playlist_items", None)
+    opts.pop("format", None)
     opts.update({
         "extract_flat":  True,
         "playlistend":   MAX_PLAYLIST,
-        "ignoreerrors":  True,         # koi ek video fail ho to poori playlist na ruke
+        "ignoreerrors":  True,
     })
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -392,9 +371,16 @@ def _blocking_playlist_info(url):
     except Exception as e:
         logger.error(f"PL info: {e}")
         return None
+
 # ═══════════════════════════════════════════
 #    DOWNLOAD
 # ═══════════════════════════════════════════
+def _find_thumb(dl_dir):
+    for f in os.listdir(dl_dir):
+        if f.endswith((".jpg",".jpeg")):
+            return os.path.join(dl_dir, f)
+    return None
+
 def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
     try:
         tracker = YtDlpProgress(smsg, loop, is_pl=is_pl)
@@ -403,13 +389,11 @@ def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
             info = ydl.extract_info(url, download=True)
             if not info: return None
             actual = ydl.prepare_filename(info)
-            # Audio ext fix
             if fmt.startswith("ba/b") or fmt == "mp3":
                 parts = fmt.split("-") if "-" in fmt else ["ba/b","mp3","192"]
                 afmt  = parts[1] if len(parts) > 1 else "mp3"
                 ext   = "ogg" if afmt == "vorbis" else "m4a" if afmt == "alac" else afmt
                 actual = os.path.splitext(actual)[0] + f".{ext}"
-            # Fallback find
             if not os.path.exists(actual):
                 dl_dir = os.path.dirname(actual)
                 base   = os.path.splitext(os.path.basename(actual))[0][:30]
@@ -417,9 +401,8 @@ def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
                     if base in f and not f.endswith((".jpg",".jpeg",".png",".webp",".part")):
                         actual = os.path.join(dl_dir or ".", f); break
             if not os.path.exists(actual) or os.path.getsize(actual) == 0:
-                # Find largest non-thumb file in dl_dir
-                found = None
-                best_sz = 0
+                found = None; best_sz = 0
+                dl_dir = os.path.dirname(actual)
                 for f in os.listdir(dl_dir or "."):
                     if f.endswith((".jpg",".jpeg",".png",".webp",".part",".ytdl")): continue
                     fp2 = os.path.join(dl_dir or ".", f)
@@ -432,7 +415,7 @@ def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
                     return None
             if not os.path.exists(actual) or os.path.getsize(actual) == 0:
                 return None
-            
+
             real_info = info
             if "entries" in info and info["entries"]:
                 real_info = info["entries"][0] or info
@@ -449,12 +432,6 @@ def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
 # ═══════════════════════════════════════════
 #    UPLOAD
 # ═══════════════════════════════════════════
-def _find_thumb(dl_dir):
-    for f in os.listdir(dl_dir):
-        if f.endswith((".jpg",".jpeg")):
-            return os.path.join(dl_dir, f)
-    return None
-
 async def upload_file(client, chat_id, result, fmt, smsg):
     fp    = result["filepath"]
     info  = result["info"]
@@ -462,13 +439,12 @@ async def upload_file(client, chat_id, result, fmt, smsg):
     upl   = info.get("uploader","") or info.get("channel","")
     sz    = os.path.getsize(fp)
 
-    # 🎯 WZML-X Style Caption: Sirf Filename aayega ab
     filename = os.path.basename(fp)
     cap = f"📁 `{filename}`"
 
     thumb = _find_thumb(os.path.dirname(fp))
     if sz > 2*1024**3:
-        await _safe_edit(smsg, "❌ File >2GB!"); return False
+        await _safe_edit(smsg, "❌ File size exceeds 2GB!"); return False
     start = time.time()
     try:
         is_audio = fmt.startswith("ba/b") or fmt == "mp3"
@@ -495,11 +471,10 @@ async def show_quality_picker(url, smsg, user_id=None):
     info = await loop.run_in_executor(None, _blocking_info, url)
     if not info:
         await _safe_edit(smsg,
-            "❌ **Could not get video info!**\n\n"
-            "• Video private/age-restricted?\n"
-            "• refresh cookies.txt\n"
-            "• check proxy\n"
-            "• is the URL correct?")
+            "❌ **Could not fetch video info!**\n\n"
+            "• Is the video private or age-restricted?\n"
+            "• Try refreshing cookies.txt\n"
+            "• Is the URL correct?")
         return
 
     fmts, is_pl = parse_formats(info)
@@ -572,13 +547,13 @@ async def ping_cmd(client, message):
 async def help_cmd(client, message):
     await message.reply_text(
         "**How to use:**\n"
-        "1. Send video/playlist URL\n"
-        "2. Choose quality\n"
+        "1. Send a video or playlist URL\n"
+        "2. Choose your quality\n"
         "3. Download! 🎉\n\n"
         "**Playlist:**\n"
-        "• Download all\n"
-        "• Select: `1,3,5` or `1-10`\n"
-        "• Thumbnails download\n\n"
+        "• Download all videos\n"
+        "• Select specific: `1,3,5` or `1-10`\n"
+        "• Download thumbnails\n\n"
         "**Quality Picker:**\n"
         "• Per-format bitrate selection\n"
         "• MP3 64/128/192/320K\n"
@@ -603,11 +578,11 @@ async def handle_url(client, message):
             total   = len(e["entries"])
             indices = _parse_sel(text, total)
             if indices is None:
-                await message.reply_text(f"❌ Invalid!\nFormat: `1,3,5` or `1-10`\nTotal: `{total}`")
+                await message.reply_text(f"❌ Invalid selection!\nFormat: `1,3,5` or `1-10`\nTotal videos: `{total}`")
                 return
             e["sel"] = indices
             WAITING_SEL.pop(uid, None)
-            smsg = await message.reply_text(f"✅ `{len(indices)}` select kiye. Quality...")
+            smsg = await message.reply_text(f"✅ Selected `{len(indices)}` videos. Fetching quality options...")
             loop = asyncio.get_event_loop()
             fu   = e["entries"][indices[0]].get("url") or e["entries"][indices[0]].get("webpage_url")
             try:
@@ -621,7 +596,7 @@ async def handle_url(client, message):
                     "user_id": uid, "pl_uid": pl_uid, "pl_indices": indices,
                 }
                 msg_t, kb = _kb_main(fmts, s_uid, False, 120)
-                await smsg.edit_text(f"🎨 **Quality:** `{len(indices)}` videos:\n\n{msg_t}", reply_markup=kb)
+                await smsg.edit_text(f"🎨 **Select Quality** for `{len(indices)}` videos:\n\n{msg_t}", reply_markup=kb)
             except Exception as ex:
                 await _safe_edit(smsg, f"❌ {ex}")
             return
@@ -635,7 +610,7 @@ async def handle_url(client, message):
     _cleanup()
 
     if is_playlist_url(url):
-        await _safe_edit(status, "📋 **Playlist info...**")
+        await _safe_edit(status, "📋 **Fetching playlist info...**")
         info = await loop.run_in_executor(None, _blocking_playlist_info, url)
         if info and info.get("_type") == "playlist":
             entries = [e for e in (info.get("entries") or []) if e][:MAX_PLAYLIST]
@@ -648,7 +623,7 @@ async def handle_url(client, message):
                 vl = ""
                 for i, e in enumerate(entries[:12], 1):
                     vl += f"`{i:02d}.` {(e.get('title') or f'Video {i}')[:35]} `[{time_fmt(e.get('duration',0))}]`\n"
-                if len(entries) > 12: vl += f"_...aur {len(entries)-12} more_"
+                if len(entries) > 12: vl += f"_...and {len(entries)-12} more_"
                 cap = (f"📋 **{pl_title}**\n👤 `{channel}`\n🎬 `{len(entries)}` videos  ⏱️ `{time_fmt(total_dur)}`\n\n{vl}\n\n**What would you like to download?**")
                 with suppress(Exception): await status.delete()
                 try:
@@ -670,9 +645,9 @@ async def quality_cb(client, query: CallbackQuery):
     uid    = parts[1]; action = parts[2]; rest = parts[3:] if len(parts) > 3 else []
     e      = URL_SESSIONS.get(uid)
     if not e:
-        await query.answer("⚠️ Session expired! Send the link again.", show_alert=True); return
+        await query.answer("⚠️ Session expired! Please send the link again.", show_alert=True); return
     if e.get("user_id") and query.from_user.id != e["user_id"]:
-        await query.answer("❌ Not yours!", show_alert=True); return
+        await query.answer("❌ This is not your session!", show_alert=True); return
     await query.answer()
     tl = max(0, e["timeout"] - (time.time() - e["created"]))
     fmts = e["fmts"]; is_pl = e["is_pl"]
@@ -716,7 +691,7 @@ async def playlist_cb(client, query: CallbackQuery):
         PL_SESSIONS.pop(uid, None); WAITING_SEL.pop(query.from_user.id, None)
         with suppress(Exception): await query.message.delete()
         await query.answer(); return
-    if not e: await query.answer("⚠️ Session expire!", show_alert=True); return
+    if not e: await query.answer("⚠️ Session expired!", show_alert=True); return
     await query.answer()
 
     if sub == "thumbs":
@@ -734,17 +709,17 @@ async def playlist_cb(client, query: CallbackQuery):
                 sent += 1; await asyncio.sleep(0.5)
             except Exception: pass
             if i % 5 == 0: await _safe_edit(sm, f"🖼️ `{i}/{len(e['entries'])}`...")
-        await _safe_edit(sm, f"✅ `{sent}` thumbnails!"); return
+        await _safe_edit(sm, f"✅ `{sent}` thumbnails sent!"); return
 
     if sub == "select":
         WAITING_SEL[query.from_user.id] = uid; total = len(e["entries"]); vl = ""
         for i, en in enumerate(e["entries"][:20], 1):
             vl += f"`{i:02d}.` {(en.get('title') or f'Video {i}')[:35]} `[{time_fmt(en.get('duration',0))}]`\n"
-        if total > 20: vl += f"_...{total-20} aur_"
-        await query.message.reply_text(f"🎯 **Select:**\nTotal: `{total}`\n\n{vl}\nFormat: `1,3,5` or `1-10`"); return
+        if total > 20: vl += f"_...{total-20} more_"
+        await query.message.reply_text(f"🎯 **Select videos:**\nTotal: `{total}`\n\n{vl}\nFormat: `1,3,5` or `1-10`"); return
 
     if sub == "all":
-        sm = await query.message.reply_text("🔍 Quality options...")
+        sm = await query.message.reply_text("🔍 Fetching quality options...")
         loop = asyncio.get_event_loop()
         fu = e["entries"][0].get("url") or e["entries"][0].get("webpage_url")
         try:
@@ -759,7 +734,7 @@ async def playlist_cb(client, query: CallbackQuery):
                 "pl_indices": list(range(len(e["entries"]))),
             }
             msg_t, kb = _kb_main(fmts2, s_uid, True, 120)
-            await sm.edit_text(f"🎨 **Quality:**\n📋 `{len(e['entries'])}` videos:\n\n{msg_t}", reply_markup=kb)
+            await sm.edit_text(f"🎨 **Select Quality:**\n📋 `{len(e['entries'])}` videos:\n\n{msg_t}", reply_markup=kb)
         except Exception as ex:
             await _safe_edit(sm, f"❌ {ex}")
 
@@ -774,7 +749,7 @@ async def _start_dl(uid, qual, e, query, client):
     pl_uid     = e.get("pl_uid")
     pl_indices = e.get("pl_indices")
 
-    smsg = await query.message.reply_text(f"⚙️ **Download shuru...**\n🎞️ `{qual[:50]}`")
+    smsg = await query.message.reply_text(f"⚙️ **Starting download...**\n🎞️ `{qual[:50]}`")
 
     if pl_uid and pl_indices is not None:
         pl_e    = PL_SESSIONS.get(pl_uid, {})
@@ -790,11 +765,11 @@ async def _dl_single(url, qual, info, smsg, client, chat_id):
     os.makedirs(dl_dir, exist_ok=True)
     out_tmpl = os.path.join(dl_dir, "%(title,fulltitle,alt_title)s %(height)sp%(fps)s.fps %(tbr)d.%(ext)s")
 
-    await _safe_edit(smsg, "⬇️ **Starting download...**")
+    await _safe_edit(smsg, "⬇️ **Downloading...**")
     result = await loop.run_in_executor(None, _blocking_download, url, qual, out_tmpl, smsg, loop, False)
 
     if not result:
-        await _safe_edit(smsg, "❌ **Download failed!**\n\n• refresh cookies.txt\n• check proxy\n• Private video?")
+        await _safe_edit(smsg, "❌ **Download failed!**\n\n• Try refreshing cookies.txt\n• Is this a private video?")
         with suppress(Exception): shutil.rmtree(dl_dir)
         return
 
@@ -845,7 +820,7 @@ async def _dl_playlist(entries, qual, base_info, smsg, client, chat_id, pl_uid):
     if failed:
         await _safe_edit(smsg, f"✅ `{total-len(failed)}/{total}` uploaded.\n❌ Failed:\n" + "\n".join(f"• `{t}`" for t in failed[:10]))
     else:
-        await _safe_edit(smsg, f"✅ **Playlist complete!** `{total}` videos! 🎉")
+        await _safe_edit(smsg, f"✅ **Playlist complete!** `{total}` videos uploaded! 🎉")
 
 # ═══════════════════════════════════════════
 #    UTILS
@@ -870,13 +845,12 @@ def _parse_sel(text, total):
 #    KOYEB HEALTH CHECK & RUNNER
 # ═══════════════════════════════════════════
 async def health_check(request):
-    return web.Response(text="Bot is running fine on Koyeb!")
+    return web.Response(text="Bot is running fine!")
 
 async def main():
     await app.start()
     logger.info("✅ Bot running with Pyrofork (Namespace: pyrogram)...")
     
-    # Koyeb Web Server Start
     web_app = web.Application()
     web_app.router.add_get('/', health_check)
     runner = web.AppRunner(web_app)

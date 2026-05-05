@@ -21,10 +21,18 @@ API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 PROXY_URL     = None  # Render/Koyeb have direct internet access, no proxy needed
-AUTH_USERS    = []    
+AUTH_USERS    = []
 MAX_PLAYLIST  = 50
-SESSION_TTL   = 600   
+SESSION_TTL   = 600
 PORT          = int(os.environ.get("PORT", 8000))
+
+# ── Render keep-alive ──────────────────────────────────────────────────────────
+# Set RENDER_EXTERNAL_URL in Render dashboard → Environment, e.g.
+#   https://your-service-name.onrender.com
+# The bot will ping itself every 10 minutes so Render doesn't spin it down.
+SELF_PING_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+PING_INTERVAL = 10 * 60  # seconds (10 min — Render sleeps after ~15 min idle)
+# ──────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
@@ -38,8 +46,9 @@ for _p in [os.path.join(BASE_DIR, "cookies.txt"), os.path.expanduser("~/cookies.
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("YTBot")
-logger.info(f"Cookies : {COOKIES_FILE or 'NOT FOUND'}")
-logger.info(f"Proxy   : {'SET' if PROXY_URL else 'NONE'}")
+logger.info(f"Cookies   : {COOKIES_FILE or 'NOT FOUND'}")
+logger.info(f"Proxy     : {'SET' if PROXY_URL else 'NONE'}")
+logger.info(f"Self-ping : {SELF_PING_URL or 'DISABLED (set RENDER_EXTERNAL_URL)'}")
 
 app = Client("yt_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -48,9 +57,9 @@ _BOT_START = time.time()
 # ═══════════════════════════════════════════
 #             SESSION STORE
 # ═══════════════════════════════════════════
-URL_SESSIONS = {}   
-PL_SESSIONS  = {}   
-WAITING_SEL  = {}   
+URL_SESSIONS = {}
+PL_SESSIONS  = {}
+WAITING_SEL  = {}
 
 def _new_uid():
     return uuid.uuid4().hex[:10]
@@ -109,12 +118,34 @@ async def _safe_edit(msg, text):
         await msg.edit_text(text)
 
 # ═══════════════════════════════════════════
-#    PROGRESS TRACKER
+#    RENDER KEEP-ALIVE
 # ═══════════════════════════════════════════
+async def keep_alive():
+    """Pings the bot's own health-check endpoint every PING_INTERVAL seconds.
+    Prevents Render free-tier from spinning the service down due to inactivity.
+    Enable by setting the RENDER_EXTERNAL_URL environment variable."""
+    if not SELF_PING_URL:
+        logger.info("keep_alive: RENDER_EXTERNAL_URL not set — self-ping disabled.")
+        return
+    await asyncio.sleep(30)  # wait for server to be fully up first
+    while True:
+        try:
+            r = requests.get(SELF_PING_URL, timeout=15)
+            logger.info(f"keep_alive: pinged {SELF_PING_URL} → {r.status_code}")
+        except Exception as e:
+            logger.warning(f"keep_alive: ping failed — {e}")
+        await asyncio.sleep(PING_INTERVAL)
+
+# ═══════════════════════════════════════════
+#    PROGRESS TRACKER  (6-second refresh)
+# ═══════════════════════════════════════════
+PROGRESS_INTERVAL = 6  # seconds between Telegram message edits
+
 class YtDlpProgress:
-    def __init__(self, msg, loop, prefix="", is_pl=False):
+    def __init__(self, msg, loop, title="", prefix="", is_pl=False):
         self.msg    = msg
         self.loop   = loop
+        self.title  = title   # ← video title shown in progress
         self.prefix = prefix
         self.is_pl  = is_pl
         self._dl    = 0
@@ -126,7 +157,7 @@ class YtDlpProgress:
 
     def hook(self, d):
         now = time.time()
-        if now - self._t < 4: return
+        if now - self._t < PROGRESS_INTERVAL: return   # ← 6-second gate
         self._t = now
         if d["status"] == "finished":
             if self.is_pl: self._last = 0
@@ -146,8 +177,11 @@ class YtDlpProgress:
         except ZeroDivisionError:
             pct = 0
         bar  = pbar(pct)
+        # Title line — only shown when a title is available
+        title_line = f"🎬 `{self.title[:55]}`\n" if self.title else ""
         text = (
-            f"{self.prefix}⬇️ **Downloading...**\n\n{bar}\n\n"
+            f"{self.prefix}{title_line}"
+            f"⬇️ **Downloading...**\n\n{bar}\n\n"
             f"📦 `{humanbytes(self._dl)}`" +
             (f" / `{humanbytes(self._size)}`" if self._size else "") +
             f"\n⚡ Speed: `{humanbytes(self._speed)}/s`" +
@@ -155,13 +189,17 @@ class YtDlpProgress:
         )
         asyncio.run_coroutine_threadsafe(_safe_edit(self.msg, text), self.loop)
 
-async def progress_for_upload(current, total, msg, start_time, label="Uploading"):
+async def progress_for_upload(current, total, msg, start_time, label="Uploading", title=""):
     now = time.time(); diff = now - start_time
-    if round(diff % 5) != 0 and current != total: return
+    # 6-second refresh gate; always fire on completion
+    if current != total and (diff < 1 or round(diff) % PROGRESS_INTERVAL != 0):
+        return
     pct   = current * 100 / total if total else 0
     speed = current / diff if diff > 0 else 0
     eta   = (total - current) / speed if speed > 0 else 0
+    title_line = f"🎬 `{title[:55]}`\n" if title else ""
     text  = (
+        f"{title_line}"
         f"📤 **{label}**\n\n{pbar(pct)}\n\n"
         f"📦 `{humanbytes(current)}` / `{humanbytes(total)}`\n"
         f"⚡ Speed: `{humanbytes(speed)}/s`\n"
@@ -202,8 +240,8 @@ def _base_opts():
 def _info_opts():
     o = _base_opts()
     o.update({
-        "quiet": True, 
-        "no_warnings": True, 
+        "quiet": True,
+        "no_warnings": True,
         "playlist_items": "0",
         "format": "bv*+ba/b"
     })
@@ -381,9 +419,9 @@ def _find_thumb(dl_dir):
             return os.path.join(dl_dir, f)
     return None
 
-def _blocking_download(url, fmt, out_tmpl, smsg, loop, is_pl=False):
+def _blocking_download(url, fmt, out_tmpl, smsg, loop, title="", is_pl=False):
     try:
-        tracker = YtDlpProgress(smsg, loop, is_pl=is_pl)
+        tracker = YtDlpProgress(smsg, loop, title=title, is_pl=is_pl)
         opts    = _dl_opts(fmt, out_tmpl, tracker, is_pl)
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -436,6 +474,7 @@ async def upload_file(client, chat_id, result, fmt, smsg):
     fp    = result["filepath"]
     info  = result["info"]
     dur   = result["duration"]
+    title = result.get("title","")          # ← carry title through to upload bar
     upl   = info.get("uploader","") or info.get("channel","")
     sz    = os.path.getsize(fp)
 
@@ -449,14 +488,20 @@ async def upload_file(client, chat_id, result, fmt, smsg):
     try:
         is_audio = fmt.startswith("ba/b") or fmt == "mp3"
         if is_audio:
-            await client.send_audio(chat_id, fp, caption=cap, duration=dur,
+            await client.send_audio(
+                chat_id, fp, caption=cap, duration=dur,
                 title=filename[:64], performer=upl, thumb=thumb,
-                progress=progress_for_upload, progress_args=(smsg, start, "Uploading Audio..."))
+                progress=progress_for_upload,
+                progress_args=(smsg, start, "Uploading Audio...", title),
+            )
         else:
-            await client.send_video(chat_id, fp, caption=cap, duration=dur,
+            await client.send_video(
+                chat_id, fp, caption=cap, duration=dur,
                 width=info.get("width",1280), height=info.get("height",720),
                 thumb=thumb, supports_streaming=True,
-                progress=progress_for_upload, progress_args=(smsg, start, "Uploading Video..."))
+                progress=progress_for_upload,
+                progress_args=(smsg, start, "Uploading Video...", title),
+            )
         return True
     except Exception as e:
         logger.error(f"Upload: {e}")
@@ -540,6 +585,7 @@ async def ping_cmd(client, message):
         f"⏱️ Uptime: `{time_fmt(time.time()-_BOT_START)}`\n"
         f"🍪 Cookies: `{'✅' if COOKIES_FILE else '❌'}`\n"
         f"🔌 Proxy: `{'✅' if PROXY_URL else '❌'}`\n"
+        f"🔄 Self-ping: `{'✅ ' + SELF_PING_URL if SELF_PING_URL else '❌ Set RENDER_EXTERNAL_URL'}`\n"
         f"📂 Sessions: `{len(URL_SESSIONS)+len(PL_SESSIONS)}`"
     )
 
@@ -749,7 +795,13 @@ async def _start_dl(uid, qual, e, query, client):
     pl_uid     = e.get("pl_uid")
     pl_indices = e.get("pl_indices")
 
-    smsg = await query.message.reply_text(f"⚙️ **Starting download...**\n🎞️ `{qual[:50]}`")
+    # Show title in the "starting" message
+    title = (info.get("title","") or "")[:55]
+    smsg = await query.message.reply_text(
+        f"⚙️ **Starting download...**\n"
+        f"🎬 `{title}`\n"
+        f"🎞️ `{qual[:50]}`"
+    )
 
     if pl_uid and pl_indices is not None:
         pl_e    = PL_SESSIONS.get(pl_uid, {})
@@ -765,15 +817,19 @@ async def _dl_single(url, qual, info, smsg, client, chat_id):
     os.makedirs(dl_dir, exist_ok=True)
     out_tmpl = os.path.join(dl_dir, "%(title,fulltitle,alt_title)s %(height)sp%(fps)s.fps %(tbr)d.%(ext)s")
 
-    await _safe_edit(smsg, "⬇️ **Downloading...**")
-    result = await loop.run_in_executor(None, _blocking_download, url, qual, out_tmpl, smsg, loop, False)
+    title = (info.get("title","") or "")[:55]
+    await _safe_edit(smsg, f"🎬 `{title}`\n⬇️ **Downloading...**")
+    result = await loop.run_in_executor(
+        None, _blocking_download, url, qual, out_tmpl, smsg, loop, title, False
+    )
 
     if not result:
         await _safe_edit(smsg, "❌ **Download failed!**\n\n• Try refreshing cookies.txt\n• Is this a private video?")
         with suppress(Exception): shutil.rmtree(dl_dir)
         return
 
-    await _safe_edit(smsg, f"📤 **Uploading...**\n📦 `{humanbytes(os.path.getsize(result['filepath']))}`")
+    sz = os.path.getsize(result["filepath"])
+    await _safe_edit(smsg, f"🎬 `{title}`\n📤 **Uploading...**\n📦 `{humanbytes(sz)}`")
     ok = await upload_file(client, chat_id, result, qual, smsg)
     if ok:
         with suppress(Exception): await smsg.delete()
@@ -797,21 +853,24 @@ async def _dl_playlist(entries, qual, base_info, smsg, client, chat_id, pl_uid):
 
         vtitle = (en.get("title") or f"Video {idx}")[:50]
         prefix = f"📋 **{idx}/{total}** — `{vtitle}`\n\n"
-        await _safe_edit(smsg, f"{prefix}⬇️ Downloading...")
+        await _safe_edit(smsg, f"{prefix}⬇️ **Downloading...**")
 
         uid     = _new_uid()
         dl_dir  = os.path.join(DOWNLOADS_DIR, uid)
         os.makedirs(dl_dir, exist_ok=True)
         out_tmpl = os.path.join(dl_dir, "%(title,fulltitle,alt_title)s %(height)sp%(fps)s.fps %(tbr)d.%(ext)s")
 
-        result = await loop.run_in_executor(None, _blocking_download, vurl, qual, out_tmpl, smsg, loop, False)
+        result = await loop.run_in_executor(
+            None, _blocking_download, vurl, qual, out_tmpl, smsg, loop, vtitle, False
+        )
 
         if not result:
             failed.append(vtitle)
             with suppress(Exception): shutil.rmtree(dl_dir)
             continue
 
-        await _safe_edit(smsg, f"{prefix}📤 `{humanbytes(os.path.getsize(result['filepath']))}`...")
+        sz = os.path.getsize(result["filepath"])
+        await _safe_edit(smsg, f"{prefix}📤 **Uploading...** `{humanbytes(sz)}`")
         ok = await upload_file(client, chat_id, result, qual, smsg)
         with suppress(Exception): shutil.rmtree(dl_dir)
         if not ok: failed.append(vtitle)
@@ -842,23 +901,30 @@ def _parse_sel(text, total):
     except: return None
 
 # ═══════════════════════════════════════════
-#    KOYEB HEALTH CHECK & RUNNER
+#    HEALTH CHECK + RUNNER
 # ═══════════════════════════════════════════
 async def health_check(request):
-    return web.Response(text="Bot is running fine!")
+    uptime = time_fmt(time.time() - _BOT_START)
+    return web.Response(
+        text=f"✅ Bot is running | Uptime: {uptime} | Sessions: {len(URL_SESSIONS)+len(PL_SESSIONS)}",
+        content_type="text/plain",
+    )
 
 async def main():
     await app.start()
     logger.info("✅ Bot running with Pyrofork (Namespace: pyrogram)...")
-    
+
     web_app = web.Application()
-    web_app.router.add_get('/', health_check)
+    web_app.router.add_get("/", health_check)
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"✅ Health check server running on port {PORT}")
-    
+
+    # Start Render keep-alive background task
+    asyncio.create_task(keep_alive())
+
     await idle()
     await app.stop()
 

@@ -1,164 +1,148 @@
 """
-Configuration and Admin/Database Management
+config.py — MongoDB connection + Cookies DB layer
+──────────────────────────────────────────────────
+Env vars used:
+  MONGO_URL           : MongoDB connection URI  (required)
+  DB_NAME             : database name           (default: ytbot)
+  COOKIES_COLLECTION  : collection name         (default: cookies)
 """
+
 import os
 import logging
-from typing import List, Optional
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from motor.motor_asyncio import AsyncIOMotorClient
 
-logger = logging.getLogger("YTBot")
+logger = logging.getLogger("YTBot.config")
 
-# ═══════════════════════════════════════════
-#          ADMIN CONFIGURATION
-# ═══════════════════════════════════════════
+# ── Connection settings ────────────────────────────────────────────────────────
+MONGO_URL          = os.environ.get("MONGO_URL", "")
+DB_NAME            = os.environ.get("DB_NAME", "ytbot")
+COOKIES_COLLECTION = os.environ.get("COOKIES_COLLECTION", "cookies")  # ← configurable
 
-# Admin IDs from environment (comma-separated)
-# Example: ADMIN_IDS="123456789,987654321"
-ADMIN_IDS = []
-admin_str = os.environ.get("ADMIN_IDS", "").strip()
-if admin_str:
-    try:
-        ADMIN_IDS = [int(x.strip()) for x in admin_str.split(",") if x.strip()]
-    except ValueError:
-        logger.warning("Invalid ADMIN_IDS format. Expected comma-separated integers.")
+# ── Globals (populated by init_mongodb) ───────────────────────────────────────
+_client: AsyncIOMotorClient | None = None
+_db     = None
 
-logger.info(f"Admins configured: {len(ADMIN_IDS)} admin(s)")
-
-# ═══════════════════════════════════════════
-#          MONGODB CONFIGURATION
-# ═══════════════════════════════════════════
-
-MONGODB_URI = os.environ.get("MONGODB_URI", "")
-DB_NAME = os.environ.get("DB_NAME", "yt_downloader")
-COOKIES_COLLECTION = "cookies"
-ADMIN_LOGS_COLLECTION = "admin_logs"
-
-mongo_client: Optional[AsyncIOMotorClient] = None
-db: Optional[AsyncIOMotorDatabase] = None
 
 async def init_mongodb():
-    """Initialize MongoDB connection"""
-    global mongo_client, db
-    
-    if not MONGODB_URI:
-        logger.warning("MONGODB_URI not set. Database features will be disabled.")
-        return False
-    
+    """Connect to MongoDB. Call once at bot startup."""
+    global _client, _db
+    if not MONGO_URL:
+        logger.warning("MONGO_URL not set — cookies DB disabled.")
+        return
     try:
-        mongo_client = AsyncIOMotorClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        # Test connection
-        await mongo_client.admin.command('ping')
-        db = mongo_client[DB_NAME]
-        logger.info(f"✅ MongoDB connected: {DB_NAME}")
-        
-        # Create indexes
-        await db[COOKIES_COLLECTION].create_index("timestamp")
-        await db[ADMIN_LOGS_COLLECTION].create_index("timestamp")
-        
-        return True
+        _client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=8000)
+        # Verify connection
+        await _client.admin.command("ping")
+        _db = _client[DB_NAME]
+        logger.info(f"✅ MongoDB connected  db={DB_NAME!r}  collection={COOKIES_COLLECTION!r}")
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
-        mongo_client = None
-        db = None
-        return False
+        _client = None
+        _db     = None
+
 
 async def close_mongodb():
-    """Close MongoDB connection"""
-    global mongo_client
-    if mongo_client:
-        mongo_client.close()
-        logger.info("MongoDB connection closed")
+    """Gracefully close the MongoDB connection."""
+    global _client, _db
+    if _client:
+        _client.close()
+        _client = None
+        _db     = None
+        logger.info("MongoDB connection closed.")
 
-# ═══════════════════════════════════════════
-#          ADMIN VERIFICATION
-# ═══════════════════════════════════════════
 
-def is_admin(user_id: int) -> bool:
-    """Check if user is an admin"""
-    if not ADMIN_IDS:  # No admins configured = anyone is admin
-        return True
-    return user_id in ADMIN_IDS
+def get_db():
+    """Return the database handle (or None if not connected)."""
+    return _db
 
-def is_auth_user(user_id: int, auth_users: List[int]) -> bool:
-    """Check if user is authorized"""
-    return not auth_users or user_id in auth_users
 
-# ═══════════════════════════════════════════
-#          DATABASE OPERATIONS
-# ═══════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  Cookies CRUD
+#  Document schema:  { _id: "cookies", data: "<file contents str>",
+#                      updated_at: <datetime>, updated_by: <int user_id> }
+# ══════════════════════════════════════════════════════════════════════════════
 
-async def save_cookies_to_db(file_path: str, admin_id: int, notes: str = ""):
-    """Save cookies.txt info to MongoDB"""
-    if not db:
-        logger.warning("Database not initialized, skipping save")
+_COOKIES_DOC_ID = "cookies"
+
+
+async def save_cookies(text: str, updated_by: int = 0) -> bool:
+    """
+    Upsert the cookies document in MongoDB.
+    Returns True on success, False if DB is unavailable.
+    """
+    db = get_db()
+    if db is None:
         return False
-    
+    from datetime import datetime, timezone
     try:
-        import time
-        from datetime import datetime
-        
-        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        
-        doc = {
-            "timestamp": datetime.utcnow(),
-            "admin_id": admin_id,
-            "file_size": file_size,
-            "file_path": file_path,
-            "notes": notes,
-            "status": "active"
-        }
-        
-        result = await db[COOKIES_COLLECTION].insert_one(doc)
-        logger.info(f"✅ Cookies saved to DB: {result.inserted_id}")
+        await db[COOKIES_COLLECTION].update_one(
+            {"_id": _COOKIES_DOC_ID},
+            {"$set": {
+                "data":       text,
+                "updated_at": datetime.now(timezone.utc),
+                "updated_by": updated_by,
+            }},
+            upsert=True,
+        )
+        logger.info(f"Cookies saved to DB by user {updated_by}  ({len(text)} chars)")
         return True
     except Exception as e:
-        logger.error(f"❌ Failed to save cookies to DB: {e}")
+        logger.error(f"save_cookies: {e}")
         return False
 
-async def log_admin_action(admin_id: int, action: str, details: str = ""):
-    """Log admin actions to MongoDB"""
-    if not db:
-        return False
-    
-    try:
-        from datetime import datetime
-        
-        doc = {
-            "timestamp": datetime.utcnow(),
-            "admin_id": admin_id,
-            "action": action,
-            "details": details
-        }
-        
-        await db[ADMIN_LOGS_COLLECTION].insert_one(doc)
-        return True
-    except Exception as e:
-        logger.error(f"❌ Failed to log admin action: {e}")
-        return False
 
-async def get_latest_cookies_info():
-    """Get latest cookies.txt info from database"""
-    if not db:
+async def load_cookies() -> str | None:
+    """
+    Fetch cookie text from MongoDB.
+    Returns the raw Netscape-format string, or None if not found / DB unavailable.
+    """
+    db = get_db()
+    if db is None:
         return None
-    
+    try:
+        doc = await db[COOKIES_COLLECTION].find_one({"_id": _COOKIES_DOC_ID})
+        if doc and doc.get("data"):
+            return doc["data"]
+        return None
+    except Exception as e:
+        logger.error(f"load_cookies: {e}")
+        return None
+
+
+async def delete_cookies() -> bool:
+    """Remove the cookies document. Returns True on success."""
+    db = get_db()
+    if db is None:
+        return False
+    try:
+        await db[COOKIES_COLLECTION].delete_one({"_id": _COOKIES_DOC_ID})
+        logger.info("Cookies deleted from DB.")
+        return True
+    except Exception as e:
+        logger.error(f"delete_cookies: {e}")
+        return False
+
+
+async def get_cookies_meta() -> dict | None:
+    """
+    Return metadata (updated_at, updated_by, size) without the full cookie data.
+    Returns None if no cookies document exists.
+    """
+    db = get_db()
+    if db is None:
+        return None
     try:
         doc = await db[COOKIES_COLLECTION].find_one(
-            {"status": "active"},
-            sort=[("timestamp", -1)]
+            {"_id": _COOKIES_DOC_ID},
+            {"data": 1, "updated_at": 1, "updated_by": 1},
         )
-        return doc
+        if not doc:
+            return None
+        return {
+            "updated_at": doc.get("updated_at"),
+            "updated_by": doc.get("updated_by", 0),
+            "size":       len(doc.get("data") or ""),
+        }
     except Exception as e:
-        logger.error(f"❌ Failed to fetch cookies info: {e}")
+        logger.error(f"get_cookies_meta: {e}")
         return None
-
-async def get_admin_logs(limit: int = 10):
-    """Get recent admin logs"""
-    if not db:
-        return []
-    
-    try:
-        logs = await db[ADMIN_LOGS_COLLECTION].find().sort("timestamp", -1).limit(limit).to_list(length=limit)
-        return logs
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch admin logs: {e}")
-        return []

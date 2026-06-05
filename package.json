@@ -1,0 +1,7 @@
+{
+  "name": "ytdwd-node-env",
+  "version": "1.0.0",
+  "description": "Dummy file for yt-dlp JS runtime compliance",
+  "repository": {},
+  "license": "MIT"
+}

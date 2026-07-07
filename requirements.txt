@@ -1,7 +1,7 @@
-pyrotgfork
+pyrofork
 tgcrypto
 yt-dlp
 requests
-aiohttp
+aiohttp[speedups]
 motor
 pymongo

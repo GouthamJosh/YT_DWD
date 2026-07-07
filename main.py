@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════╝
 """
 
-import os, re, time, math, uuid, logging, asyncio, requests, yt_dlp, shutil
+import os, re, sys, time, math, uuid, json, logging, asyncio, requests, yt_dlp, shutil
 from contextlib import suppress
 from datetime import datetime
 
@@ -43,6 +43,7 @@ PING_INTERVAL = 10 * 60
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+RESTART_INFO_FILE = os.path.join(BASE_DIR, ".restart_info.json")
 
 # NOTE: COOKIES_FILE is now dynamic — resolved per-download via get_cookies_path()
 # The module-level constant below is kept only for the /ping status display.
@@ -604,7 +605,7 @@ async def show_quality_picker(url, smsg, user_id=None):
 # ═══════════════════════════════════════════
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    admin_hint = "\n\n**Admin Commands:**\n`/setcookies` `/getcookies` `/cookiesstatus`" if is_admin(message.from_user.id) else ""
+    admin_hint = "\n\n**Admin Commands:**\n`/setcookies` `/getcookies` `/cookiesstatus` `/restart`" if is_admin(message.from_user.id) else ""
     await message.reply_text(
         "🎬 **Advanced YouTube Downloader**\n\n"
         "_WZML-X Style Quality Picker_\n\n"
@@ -639,6 +640,50 @@ async def ping_cmd(client, message):
         f"📂 Sessions: `{len(URL_SESSIONS)+len(PL_SESSIONS)}`"
     )
 
+@app.on_message(filters.command("restart") & filters.private)
+async def restart_cmd(client, message):
+    """Admin command: pip-upgrade all packages, then restart the bot process.
+    Sends a confirmation PM to the same admin once the new process is up."""
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        await message.reply_text("⛔ Admin only.")
+        return
+
+    msg = await message.reply_text("🔄 **Restarting bot...**\n📦 Updating packages, please wait...")
+
+    # Remember who to notify once the fresh process comes back up
+    try:
+        with open(RESTART_INFO_FILE, "w") as f:
+            json.dump({"chat_id": message.chat.id, "message_id": msg.id}, f)
+    except Exception as e:
+        logger.error(f"restart: could not write restart info: {e}")
+
+    # Upgrade every package pinned in requirements.txt before restarting
+    req_path = os.path.join(BASE_DIR, "requirements.txt")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "--upgrade", "-r", req_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        tail = out.decode(errors="ignore")[-300:] if out else ""
+        if proc.returncode == 0:
+            await msg.edit_text("✅ **Packages updated.**\n🔁 Restarting now...")
+        else:
+            await msg.edit_text(
+                f"⚠️ **Package update failed** (exit `{proc.returncode}`), restarting anyway...\n`{tail}`"
+            )
+    except Exception as e:
+        logger.error(f"restart: pip upgrade failed: {e}")
+        await msg.edit_text(f"⚠️ Package update error: `{str(e)[:150]}`\n🔁 Restarting anyway...")
+
+    logger.info(f"Restart triggered by admin {user_id}")
+    with suppress(Exception):
+        await app.stop()
+    with suppress(Exception):
+        await config.close_mongodb()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message):
     admin_section = ""
@@ -648,7 +693,8 @@ async def help_cmd(client, message):
             "`/setcookies` — attach or reply-to a `cookies.txt` to update\n"
             "`/getcookies` — download current cookies from DB\n"
             "`/delcookies` — delete cookies from DB\n"
-            "`/cookiesstatus` — show cookies metadata & DB status"
+            "`/cookiesstatus` — show cookies metadata & DB status\n"
+            "`/restart` — update all packages & restart the bot"
         )
     await message.reply_text(
         "**How to use:**\n"
@@ -978,6 +1024,20 @@ async def health_check(request):
         content_type="text/plain",
     )
 
+async def _report_restart():
+    """If a /restart just happened, PM the admin who triggered it that we're back up."""
+    if not os.path.exists(RESTART_INFO_FILE):
+        return
+    try:
+        with open(RESTART_INFO_FILE) as f:
+            info = json.load(f)
+        await app.send_message(info["chat_id"], "✅ **Bot restarted successfully!**\nAll packages are up to date.")
+    except Exception as e:
+        logger.error(f"restart report failed: {e}")
+    finally:
+        with suppress(Exception):
+            os.remove(RESTART_INFO_FILE)
+
 async def main():
     await app.start()
     logger.info("✅ Bot running with Pyrofork (Namespace: pyrogram)...")
@@ -985,13 +1045,16 @@ async def main():
     # ── 1. MongoDB ──────────────────────────────────────────────────────────
     await config.init_mongodb()
 
-    # ── 2. Cookies: auto-import local → DB, or restore DB → local ──────────
+    # ── 2. Report back if this start is the result of a /restart ───────────
+    await _report_restart()
+
+    # ── 3. Cookies: auto-import local → DB, or restore DB → local ──────────
     await auto_import_local_cookies(app)
 
-    # ── 3. Cookies admin handlers ───────────────────────────────────────────
+    # ── 4. Cookies admin handlers ───────────────────────────────────────────
     await setup_cookies_handlers(app)
 
-    # ── 4. Web health-check ─────────────────────────────────────────────────
+    # ── 5. Web health-check ─────────────────────────────────────────────────
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
     runner = web.AppRunner(web_app)
@@ -1000,7 +1063,7 @@ async def main():
     await site.start()
     logger.info(f"✅ Health check server running on port {PORT}")
 
-    # ── 5. Render keep-alive ────────────────────────────────────────────────
+    # ── 6. Render keep-alive ────────────────────────────────────────────────
     asyncio.create_task(keep_alive())
 
     await idle()

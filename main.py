@@ -238,7 +238,7 @@ def _base_opts(cookies_path: str | None = None):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
-        "extractor_args": {"youtube": {"player_client": ["web","tv"], "skip": ["dash"]}},
+        "extractor_args": {"youtube": {"player_client": ["web","tv"]}},
         "remote_components": ["ejs:github"],
     }
     # ── cookies: use the path passed in (freshly resolved from DB) ──────────
